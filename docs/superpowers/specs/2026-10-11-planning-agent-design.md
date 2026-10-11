@@ -35,9 +35,22 @@ This topic is that revisit, run as an experiment rather than as a core change.
 and that decision stands. This topic does not reopen it. It uses LangGraph
 where the repo already allows it:
 
-1. **No new dependency.** `langgraph>=0.3` is already declared in the `arena`
-   extra in `pyproject.toml`, and `lab/memory-native/langmem_native.py` already
-   imports it. Nothing is added to the default install, which keeps hard rule 3.
+1. **No new dependency, and no change to `pyproject.toml`.** The topic states
+   its own `pip install` in its header, which conventions §6 rule 4 allows lab
+   code to do: "Use the stdlib or an extra that already exists, or state the
+   `pip install` in the file's own header." `lab/memory-native/langmem_native.py`
+   is the precedent. Nothing is added to the default install, which keeps hard
+   rule 3, and the repo's dependency surface is untouched.
+
+   This matters because the existing `arena` extra is **not sufficient** for
+   this topic. `langgraph>=0.3` resolves to 1.2.14, whose runtime dependencies
+   are `langchain-core`, `langgraph-checkpoint`, `langgraph-prebuilt`,
+   `langgraph-sdk`, `pydantic` and `xxhash`. The SQLite checkpointer is a
+   **separate distribution**, `langgraph-checkpoint-sqlite` (3.1.1, which itself
+   pulls `aiosqlite` and `sqlite-vec`). Installing `.[arena]` therefore gives
+   in-memory checkpointing only, and phase 3 — the kill-and-resume check this
+   whole topic rests on — would fail on a fresh environment. `arena` is a
+   memory-backend extra in any case, which planning is not.
 2. **`lab/` is the designated home.** Conventions §6: "`lab/` holds one folder
    per outside topic: another agent, model or memory product, and how Waku's
    agent, memory and skills connect to it."
@@ -71,10 +84,15 @@ Rules this topic lives under, all already enforced:
 - **`make gate` never depends on this folder.** Its own checks run from
   `run.py`, not from `evals/`.
 - **A dated version header.** Conventions §6 rule 5. LangGraph is not installed
-  in a default environment, so the first implementation task pins the version,
-  records it in the README's `Verified against:` line, and confirms the real
-  import paths for the checkpointer and store, which have moved between
-  LangGraph majors.
+  in a default environment, so the first implementation task installs it,
+  records the resolved versions in the README's `Verified against:` line, and
+  confirms the real import paths for the checkpointer and store, which have
+  moved between LangGraph majors. As of 2026-10-11 PyPI serves langgraph
+  1.2.14 and langgraph-checkpoint-sqlite 3.1.1; the install line is
+  `pip install langgraph langgraph-checkpoint-sqlite`. Note that the `>=0.3`
+  floor in `arena` spans a major version boundary, so an existing environment
+  and a fresh one can resolve to materially different APIs — which is the
+  reason the verified line exists.
 
 The directory is created when implementation starts, not now:
 `test_lab_topics_follow_the_playbook` requires a complete playbook and a
@@ -239,6 +257,9 @@ Each phase is one component plan, written when it is reached.
 7. **Three memory tiers**, with step digests as the span-crossing tier.
 8. **One episode per finished task**, facts via existing consolidation.
 9. **The lab folder is created at implementation time**, with a verified version.
+10. **The topic declares its own `pip install`** rather than amending the `arena`
+    extra, which does not carry the SQLite checkpointer and is scoped to memory
+    backends.
 
 ## 12. Open questions
 
