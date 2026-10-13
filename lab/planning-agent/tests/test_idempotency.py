@@ -10,7 +10,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from lab.planning_agent.idempotency import (
-    DedupTable, call_key, is_side_effecting, looks_like_failure,
+    DedupTable, call_key, is_side_effecting,
 )
 
 

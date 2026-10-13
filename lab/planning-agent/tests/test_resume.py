@@ -1,5 +1,3 @@
-import os
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -11,7 +9,6 @@ pytest.importorskip("langgraph")
 
 from lab.planning_agent.digest import ROLLUP_CHARS
 from lab.planning_agent.graph import build_graph
-from lab.planning_agent.idempotency import DedupTable
 from lab.planning_agent.session import open_dedup, open_saver, thread_config
 from lab.planning_agent.state import new_state
 
@@ -226,7 +223,11 @@ def test_a_killed_process_resumes_without_repeating_the_side_effect(tmp_path):
 
     first = subprocess.run([sys.executable, str(worker), ckpt, state_db, world,
                             "die", "start"], capture_output=True, text=True)
+    # os._exit(1) and an ordinary traceback both exit 1, so check for the
+    # traceback too: without this the test passes on a broken worker.
     assert first.returncode == 1, f"the worker should have died: {first.stderr}"
+    assert "Traceback" not in first.stderr, (
+        f"the worker died of something other than os._exit: {first.stderr}")
     assert Path(world).read_text().split() == ["a", "b"]
 
     second = subprocess.run([sys.executable, str(worker), ckpt, state_db, world,

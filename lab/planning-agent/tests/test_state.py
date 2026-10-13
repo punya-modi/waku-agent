@@ -1,5 +1,3 @@
-import operator
-
 import pytest
 
 pytest.importorskip("langgraph")
@@ -8,7 +6,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from lab.planning_agent.state import (
-    MAX_REPLANS, MAX_STEP_ATTEMPTS, PlanState, attempts, new_state, next_step,
+    PlanState, attempts, new_state, next_step,
 )
 
 

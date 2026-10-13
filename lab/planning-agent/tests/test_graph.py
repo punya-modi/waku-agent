@@ -120,7 +120,6 @@ def test_a_replan_under_the_cap_still_wins():
 def test_the_replan_edge_does_not_buy_a_step_past_the_budget():
     """Review Focus 6. The replan node runs, and then the same budget gate
     that guards the first step guards the next one."""
-    log: list[str] = []
 
     def failing_once(state):
         # One step that asks for a replan without spending anything, which is

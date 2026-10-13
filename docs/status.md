@@ -6,7 +6,7 @@
 Read this before opening a PR or filing an issue: most of what is already
 known-broken is below, and half of it already has a fix in flight.
 
-**Last updated:** 2026-09-23
+**Last updated:** 2026-10-12
 
 ---
 
@@ -62,6 +62,10 @@ Additionally, and worth stating because people ask:
   needs an API key, which CI does not have.
 - **No provider smoke check.** Nothing verifies that a model in the picker
   resolves, which is why #137 reached a user.
+- **No LangGraph dependency.** `lab/planning-agent/` built a resumable planning
+  agent on it and concluded that `waku/graph/` should grow its own SQLite
+  checkpointer instead; the verdict and the measurements are in that topic's
+  README.
 
 ## Open questions
 
