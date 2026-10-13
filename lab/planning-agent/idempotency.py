@@ -144,3 +144,37 @@ class DedupTable:
         self.record(key, result,
                     status="error" if looks_like_failure(result) else "ok")
         return result
+
+
+def guarded_registry(tools, table: DedupTable, thread_id: str, step_id: str):
+    """The same tools, with the side-effecting ones deduped for this step.
+
+    run_loop executes tools itself, so this is the only place a guard can sit
+    and still be reached. Read-only tools pass through untouched: re-reading is
+    free, and replaying a stale read would be worse than making the call.
+
+    The schemas the model sees do not change, so this is invisible from the
+    prompt's side.
+    """
+    from dataclasses import replace
+
+    from waku.tools.registry import ToolRegistry
+
+    guarded = ToolRegistry()
+    for schema in tools.schemas():
+        tool = tools.get(schema["name"])
+        if tool is None:
+            continue
+        if not is_side_effecting(tool.name):
+            guarded.register(tool)
+            continue
+
+        def wrapped(_tool=tool, **kwargs) -> str:
+            # Underscore keys are the loop's own channels (_notify), not part
+            # of what the model asked for, so they stay out of the key.
+            args = {k: v for k, v in kwargs.items() if not k.startswith("_")}
+            return table.guard(thread_id, step_id, _tool.name, args,
+                               lambda: _tool.fn(**kwargs))
+
+        guarded.register(replace(tool, fn=wrapped))
+    return guarded
