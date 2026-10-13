@@ -1,6 +1,14 @@
 # Planning Agent Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** work this plan one ticket at a time from
+> `.scratch/planning-agent/issues/`, which carries the status, the blocking
+> edges and the acceptance criteria; each ticket names the task below that holds
+> its failing test and implementation. Use the `implement` skill, one ticket per
+> session, clearing context between tickets: each ticket is self-contained, so
+> the last one's context is disposable. Steps use checkbox (`- [ ]`) syntax for
+> tracking. (`superpowers:subagent-driven-development` also works and keeps each
+> task in its own window; pick one and stay in it rather than mixing them
+> mid-build.)
 
 **Goal:** Build a LangGraph planning agent in `lab/planning-agent/` that decomposes a goal into steps, runs each step as a Waku `run_loop` turn, revises the plan when work is discovered, and resumes after a crash without repeating side effects.
 
