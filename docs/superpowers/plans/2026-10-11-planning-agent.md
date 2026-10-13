@@ -22,7 +22,7 @@
 - **No `.excalidraw` files** in the topic. Commit PNGs under `screenshots/` only.
 - **Routers are code, never LLM calls.** Models write state; functions read it and pick the edge.
 - **Hard rule 1: never wipe runtime data.** The dedup table lives in `state.db`. Nothing in this topic deletes or recreates it. The scratch directory is per task and may be removed freely.
-- **Verified facts to build on (do not re-derive):** `SqliteSaver(conn)` takes a `sqlite3.Connection` and needs `.setup()`; `SqliteSaver.from_conn_string(s)` is a context manager. `invoke(None, config)` resumes a thread. `Annotated[list[X], operator.add]` appends; a bare annotation replaces. The default `recursion_limit` resolves to 10007. **Resume re-runs the whole failed node**, so a side effect that committed before the exception happens twice — this is measured, not theoretical (see Task 5).
+- **Verified facts to build on (do not re-derive):** `SqliteSaver(conn)` takes a `sqlite3.Connection` and needs `.setup()`; `SqliteSaver.from_conn_string(s)` is a context manager. `invoke(None, config)` resumes a thread. `Annotated[list[X], operator.add]` appends; a bare annotation replaces. The default `recursion_limit` resolves to 10007. **Resume re-runs the whole failed node**, so a side effect that committed before the exception happens twice — this is measured, not theoretical (see Task 5). `ToolRegistry.execute` catches a tool's exception and returns `f"Error running {name}: {exc}"` as an ordinary string, so a failure is not distinguishable from a result by type. `Tool` is a dataclass, so `dataclasses.replace(tool, fn=...)` is how a guard is attached, and `wants_notify` carries over with it. `run_loop`'s observer is called as `notify(kind, event)` and its `llm` events carry `{"usage": {"in": N, "out": N}}`. `waku/tools/calendar.py` calls `conn.commit()` on line 441 and `_write_ics` on line 442, in that order, which is the skipped-sync hole. A rollup of eight 600-char digests against an 800-char cap saves about 2.2x on a 24-step prompt; the same measurement at a 120-char digest size saves almost nothing, which is why `measure` reads its size from `digest.py`.
 
 ## Deliberately not in this plan
 
@@ -40,6 +40,13 @@ oversight, and an executor should not add them unprompted.
    when it is written, and the phasing does not include it either. It needs a
    design decision before it needs a task, so it is left for a follow-up rather
    than guessed at here.
+3. **The strategy split and the `decompose` node.** Spec section 5 routes on
+   `state["strategy"]` across `deterministic`, `hierarchical` and
+   `orchestrated`, with a `decompose` node for the middle one. It collapsed
+   into one plan-execute-replan cycle, which spec section 13 question 3
+   anticipated: the three strategies differ by prompt, not by topology. So
+   `strategy` is not a field on `PlanState` and there is no strategy router.
+   Adding either back is a design change, not a gap to fill in.
 
 ## Review Focus
 
@@ -48,6 +55,9 @@ oversight, and an executor should not add them unprompted.
 3. **A dedup key must include `thread_id`.** Without it, two different tasks performing the same action collide, and the second one is silently skipped — a real booking that never happens.
 4. **A step id used in a scratch filename** must be validated against a closed character set. An id containing `/` or `..` writes outside the scratch directory.
 5. **`budget_limit` of zero or less** must halt before any step runs, not after the first one has already been paid for.
+6. **The replan edge must not buy a step.** `after_step` answers `replan` before it checks the budget, so a plain `replan -> execute_step` edge spends one more step past the limit. The edge is conditional, through `after_plan`, which already checks budget, an empty plan and nothing-left.
+7. **A task must terminate even when nothing costs anything.** A `run_loop` that raises before its first model call leaves `budget_spent` untouched, so the budget is not a termination bound. Two bounds are: a step with two lessons against it is skipped, and a global `replans` count caps the cycle at five. The per-step bound alone is evadable, because a replanner that renames a failed step resets its lesson count.
+8. **A dedup row must distinguish success from failure.** `ToolRegistry.execute` returns `f"Error running {name}: {exc}"` as an ordinary string, and tool bodies return their own error prose in no fixed format. A table that records results without a status replays a transient failure for ever.
 
 ---
 
@@ -157,11 +167,13 @@ git commit -m "Add the planning-agent lab topic with its playbook"
 
 **Files:**
 - Create: `lab/planning-agent/state.py`
+- Create: `lab/planning-agent/_path.py`
 - Test: `lab/planning-agent/tests/test_state.py`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `PlanState` (TypedDict), the record types `Step`, `StepResult`, `Revision`, `Lesson`, `Rollup`, `next_step(state) -> Step | None`, and `new_state(goal, budget_limit) -> PlanState`.
+- Produces: `PlanState` (TypedDict), the record types `Step`, `StepResult`, `Revision`, `Lesson`, `Rollup`, `next_step(state) -> Step | None`, `new_state(goal, budget_limit) -> PlanState`, `MAX_STEP_ATTEMPTS`, `MAX_REPLANS`.
+- Also produces `_path.py`, the import shim. The directory is `planning-agent` with a hyphen, which Python cannot import, so one module installs the `lab.planning_agent` alias and everything else imports it first. `tests/conftest.py` imports it so pytest works, and `run.py` imports it so the documented `python lab/planning-agent/run.py` command works. Putting the alias only in `conftest.py` leaves `run.py` broken on a clean shell.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -177,7 +189,13 @@ pytest.importorskip("langgraph")
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from lab.planning_agent.state import PlanState, new_state, next_step
+from lab.planning_agent.state import (
+    MAX_REPLANS, MAX_STEP_ATTEMPTS, PlanState, attempts, new_state, next_step,
+)
+
+
+def _steps(*ids):
+    return [{"id": i, "description": i, "status": "pending"} for i in ids]
 
 
 def test_plan_is_replaced_and_done_is_appended():
@@ -235,8 +253,39 @@ def test_new_state_starts_every_appended_list_empty():
     assert state["goal"] == "goal text"
     assert state["budget_limit"] == 2.5
     assert state["budget_spent"] == 0.0
+    assert state["replans"] == 0
+    assert "strategy" not in state, "the strategy split collapsed; see the preamble"
     for key in ("plan", "done", "revisions", "lessons", "rollups"):
         assert state[key] == [], key
+
+
+def test_a_step_that_failed_twice_is_skipped_rather_than_retried_for_ever():
+    """Review Focus 7. A step whose run_loop raises before its first model call
+    costs nothing, so the budget never advances and the step is selected again
+    until the recursion limit stops the task."""
+    state = new_state("g", budget_limit=1.0)
+    state["plan"] = _steps("a", "b")
+    state["lessons"] = [
+        {"step_id": "a", "attempt": "x", "failure": "boom", "diagnosis": "d"},
+        {"step_id": "a", "attempt": "x", "failure": "boom", "diagnosis": "d"},
+    ]
+    assert next_step(state)["id"] == "b", "'a' is exhausted and must be passed over"
+
+
+def test_one_failure_is_not_enough_to_abandon_a_step():
+    state = new_state("g", budget_limit=1.0)
+    state["plan"] = _steps("a", "b")
+    state["lessons"] = [{"step_id": "a", "attempt": "x", "failure": "boom",
+                         "diagnosis": "d"}]
+    assert next_step(state)["id"] == "a", "one retry is the point of a lesson"
+
+
+def test_attempts_counts_lessons_for_one_step_only():
+    state = new_state("g", budget_limit=1.0)
+    state["lessons"] = [{"step_id": "a", "attempt": "", "failure": "", "diagnosis": ""},
+                        {"step_id": "b", "attempt": "", "failure": "", "diagnosis": ""}]
+    assert attempts(state, "a") == 1
+    assert attempts(state, "zzz") == 0
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -313,51 +362,86 @@ class PlanState(TypedDict):
     rollups: Annotated[list[Rollup], operator.add]
     budget_spent: float  # USD, the same unit as the usage.jsonl ledger
     budget_limit: float
-    strategy: str
     replan_requested: bool
     last_error: str
+    # Replans so far, across the whole task. A bare annotation, so each write
+    # replaces it. This is the termination bound that cannot be evaded: the
+    # per-step one below counts lessons by step id, and a replanner that
+    # renames a failed step resets that count to zero.
+    replans: int
+
+
+# Two attempts at a step, then it is skipped rather than retried for ever.
+MAX_STEP_ATTEMPTS = 2
+# And five replans for the whole task, whatever the step ids look like.
+MAX_REPLANS = 5
 
 
 def new_state(goal: str, budget_limit: float) -> PlanState:
     return PlanState(goal=goal, plan=[], done=[], revisions=[], lessons=[],
                      rollups=[], budget_spent=0.0, budget_limit=budget_limit,
-                     strategy="", replan_requested=False, last_error="")
+                     replan_requested=False, last_error="", replans=0)
+
+
+def attempts(state: PlanState, step_id: str) -> int:
+    """How many times a step has been tried and left a lesson behind."""
+    return sum(1 for lesson in state["lessons"] if lesson["step_id"] == step_id)
 
 
 def next_step(state: PlanState) -> Step | None:
-    """The first step in `plan` that has no result in `done`, or None.
+    """The first step in `plan` that is neither finished nor exhausted, or None.
 
     Selected by id, never by position. A replanner may reorder the plan, drop
     steps from it or shorten it, and `len(done)` can legitimately exceed
     `len(plan)` afterwards; an index would then point past the end or at a step
     that already ran.
+
+    A step with MAX_STEP_ATTEMPTS lessons against it is skipped. Without that,
+    a step that fails before its first model call costs nothing, leaves
+    `budget_spent` untouched, and is selected again for ever: the budget is not
+    a termination bound when failing is free.
     """
     finished = {result["step_id"] for result in state["done"]}
     for step in state["plan"]:
-        if step["id"] not in finished:
-            return step
+        if step["id"] in finished:
+            continue
+        if attempts(state, step["id"]) >= MAX_STEP_ATTEMPTS:
+            continue
+        return step
     return None
 ```
 
-Write `lab/planning-agent/tests/conftest.py`, so `lab.planning_agent` imports
-despite the hyphen in the directory name:
+Write `lab/planning-agent/_path.py`, the one place the hyphen is worked
+around. `tests/conftest.py` loads it so pytest works, and `run.py` loads it so
+the README's documented command works on a clean shell.
+
+Both load it by file path rather than by import, because the hyphen blocks an
+ordinary import of anything in this directory, `_path.py` included. That is the
+whole chicken-and-egg problem: the fix cannot be imported the normal way.
+`run.py` does it with the same four lines `conftest.py` uses, assigning the
+module a plain name (`lab_planning_agent_path`) so the import below reads
+clearly:
 
 ```python
 """Make `lab/planning-agent` importable as `lab.planning_agent`.
 
-Python cannot import a directory with a hyphen, and the directory name is fixed
-by the lab playbook. Registering an alias in sys.modules is the smallest fix
-that keeps both the directory name and ordinary import statements.
+Python cannot import a directory with a hyphen, and the directory name is
+fixed by the lab playbook. Registering an alias in sys.modules is the smallest
+fix that keeps both the directory name and ordinary import statements.
+
+This lives in its own module rather than in tests/conftest.py because pytest is
+not the only entry point: run.py is a documented command in the README, and a
+conftest is never loaded for it.
 """
 
 import importlib.util
 import sys
 from pathlib import Path
 
-TOPIC = Path(__file__).resolve().parent.parent
+TOPIC = Path(__file__).resolve().parent
 
 
-def _install_alias() -> None:
+def install_alias() -> None:
     if "lab.planning_agent" in sys.modules:
         return
     lab = importlib.util.module_from_spec(
@@ -373,13 +457,27 @@ def _install_alias() -> None:
     spec.loader.exec_module(module)
 
 
-_install_alias()
+install_alias()
+```
+
+Write `lab/planning-agent/tests/conftest.py`, which is only a loader for it:
+
+```python
+"""Install the lab.planning_agent alias before any test imports it."""
+
+import importlib.util
+from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    "_planning_agent_path", Path(__file__).resolve().parent.parent / "_path.py")
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `python -m pytest lab/planning-agent/tests/test_state.py -q`
-Expected: PASS, 5 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Prove the reducer test can fail**
 
@@ -392,7 +490,7 @@ Record in the commit message what you broke.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add lab/planning-agent/state.py lab/planning-agent/tests/
+git add lab/planning-agent/state.py lab/planning-agent/_path.py lab/planning-agent/tests/
 git commit -m "Add PlanState: plan replaced, histories appended"
 ```
 
@@ -689,7 +787,7 @@ git commit -m "Add the scratch directory for full step outputs"
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `READ_ONLY: frozenset[str]`, `is_side_effecting(tool: str) -> bool`, `call_key(thread_id: str, step_id: str, tool: str, args: dict) -> str`, and `DedupTable(conn: sqlite3.Connection)` with `.setup()`, `.recorded(key) -> str | None`, `.record(key, result)`, `.guard(thread_id, step_id, tool, args, fn) -> str`.
+- Produces: `READ_ONLY: frozenset[str]`, `is_side_effecting(tool: str) -> bool`, `looks_like_failure(result: str) -> bool`, `call_key(thread_id: str, step_id: str, tool: str, args: dict) -> str`, and `DedupTable(conn: sqlite3.Connection)` with `.setup()`, `.recorded(key) -> str | None`, `.record(key, result, status)`, `.guard(thread_id, step_id, tool, args, fn) -> str`.
 
 **This task comes before the checkpointer on purpose.** Resuming a crashed
 graph re-runs the whole failed node, which is measured: a step that appended to
@@ -714,7 +812,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from lab.planning_agent.idempotency import (
-    DedupTable, call_key, is_side_effecting,
+    DedupTable, call_key, is_side_effecting, looks_like_failure,
 )
 
 
@@ -756,6 +854,48 @@ def test_two_tasks_doing_the_same_thing_do_not_dedupe_against_each_other():
     table.guard("task-1", "s1", "create_event", {"title": "lunch"}, book)
     table.guard("task-2", "s1", "create_event", {"title": "lunch"}, book)
     assert calls == ["booked", "booked"], "two separate tasks must both act"
+
+
+def test_a_failed_call_is_recorded_but_not_replayed():
+    """Review Focus 8. A timeout is transient. Recording it keeps the crash
+    window closed; replaying it would freeze one bad minute into the task."""
+    conn = sqlite3.connect(":memory:")
+    table = DedupTable(conn)
+    table.setup()
+    results = iter(["Error running create_event: timed out", "event 7 created"])
+
+    def book():
+        return next(results)
+
+    first = table.guard("t", "s1", "create_event", {"title": "lunch"}, book)
+    second = table.guard("t", "s1", "create_event", {"title": "lunch"}, book)
+    assert first.startswith("Error running")
+    assert second == "event 7 created", "the retry must reach the tool"
+    rows = conn.execute("SELECT status FROM planning_tool_calls").fetchall()
+    assert [r[0] for r in rows] == ["ok"], "the error row was replaced by the success"
+
+
+def test_a_raised_call_is_recorded_as_an_error_and_re_raised():
+    conn = sqlite3.connect(":memory:")
+    table = DedupTable(conn)
+    table.setup()
+
+    def boom():
+        raise RuntimeError("the API refused")
+
+    with pytest.raises(RuntimeError, match="refused"):
+        table.guard("t", "s1", "create_event", {"title": "lunch"}, boom)
+    row = conn.execute("SELECT status, result FROM planning_tool_calls").fetchone()
+    assert row[0] == "error"
+    assert "refused" in row[1]
+
+
+def test_setup_refuses_a_table_that_predates_the_status_column():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE planning_tool_calls (key TEXT PRIMARY KEY, result TEXT)")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="status column"):
+        DedupTable(conn).setup()
 
 
 def test_a_replayed_call_returns_the_recorded_result_without_running_again():
@@ -901,6 +1041,18 @@ def is_side_effecting(tool: str) -> bool:
     return tool not in READ_ONLY
 
 
+# ToolRegistry.execute catches a tool's exception and returns this prefix as an
+# ordinary string, so a caller cannot tell a failure from a result by type
+# alone. Tool bodies also return their own error prose; the match is therefore
+# a heuristic, and the status column is what makes it correctable rather than
+# load-bearing.
+FAILURE_PREFIXES = ("Error running ", "Error:")
+
+
+def looks_like_failure(result: str) -> bool:
+    return result.lstrip().startswith(FAILURE_PREFIXES)
+
+
 def call_key(thread_id: str, step_id: str, tool: str, args: dict) -> str:
     """The identity of one intended call.
 
@@ -925,46 +1077,78 @@ class DedupTable:
         self.conn = conn
 
     def setup(self) -> None:
+        """Create the table, then check the columns actually present.
+
+        CREATE TABLE IF NOT EXISTS is silent about a table that already exists
+        with an older shape, and the queries below would then fail somewhere
+        far away. Nothing here drops or rewrites the table: it is runtime data
+        under hard rule 1, so a stale schema is reported, never repaired.
+        """
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS planning_tool_calls ("
             " key TEXT PRIMARY KEY,"
             " result TEXT NOT NULL,"
+            " status TEXT NOT NULL,"
             " recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         self.conn.commit()
+        columns = {row[1] for row in
+                   self.conn.execute("PRAGMA table_info(planning_tool_calls)")}
+        missing = {"key", "result", "status"} - columns
+        if missing:
+            raise RuntimeError(
+                f"planning_tool_calls is missing {sorted(missing)}: it predates the "
+                "status column. Nothing here will alter it; migrate it by hand.")
 
     def recorded(self, key: str) -> str | None:
+        """The recorded result for a call that succeeded, or None.
+
+        A row with status 'error' is deliberately not a hit. The call is
+        remembered so a crash cannot lose it, and it is re-run because a
+        timeout or a rate limit is transient; replaying it would freeze one bad
+        minute into the task for ever.
+        """
         row = self.conn.execute(
-            "SELECT result FROM planning_tool_calls WHERE key = ?", (key,)).fetchone()
+            "SELECT result FROM planning_tool_calls WHERE key = ? AND status = 'ok'",
+            (key,)).fetchone()
         return row[0] if row else None
 
-    def record(self, key: str, result: str) -> None:
+    def record(self, key: str, result: str, status: str = "ok") -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO planning_tool_calls (key, result) VALUES (?, ?)",
-            (key, result))
+            "INSERT OR REPLACE INTO planning_tool_calls (key, result, status) "
+            "VALUES (?, ?, ?)", (key, result, status))
         self.conn.commit()
 
     def guard(self, thread_id: str, step_id: str, tool: str, args: dict,
               fn: Callable[[], str]) -> str:
         """Run `fn` once per identical call, and return what it returned.
 
-        The result is recorded before this returns, so the next attempt after a
-        crash finds it. A crash between the tool's own commit and this record
-        still repeats the call once: that window is why the goal is a dedup
-        window rather than exactly-once.
+        Every outcome is recorded before this returns, so the next attempt
+        after a crash finds it; only a successful one is replayed. A crash
+        between the tool's own commit and this record still repeats the call
+        once: that window is why the goal is a dedup window rather than
+        exactly-once.
+
+        A raised exception is recorded as an error and re-raised. The step above
+        turns it into a Lesson, and the call stays retryable.
         """
         key = call_key(thread_id, step_id, tool, args)
         seen = self.recorded(key)
         if seen is not None:
             return seen
-        result = fn()
-        self.record(key, result)
+        try:
+            result = fn()
+        except Exception as exc:
+            self.record(key, f"{type(exc).__name__}: {exc}", status="error")
+            raise
+        self.record(key, result,
+                    status="error" if looks_like_failure(result) else "ok")
         return result
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `python -m pytest lab/planning-agent/tests/test_idempotency.py -q`
-Expected: PASS, 7 tests. In particular
+Expected: PASS, 10 tests. In particular
 `test_without_the_dedup_table_resume_repeats_the_side_effect` passes by
 observing the duplicate, and the next test passes by its absence.
 
@@ -1105,6 +1289,46 @@ def test_an_exhausted_budget_stops_the_cycle_even_with_work_left():
     assert after_step(state) == "synthesize"
 
 
+def test_a_replan_is_refused_once_the_cap_is_reached():
+    """Review Focus 7. Without this the cycle runs until the recursion limit,
+    and every lap costs a model call once the nodes are real."""
+    state = new_state("g", budget_limit=1.0)
+    state["plan"] = _steps("a", "b")
+    state["replan_requested"] = True
+    state["replans"] = 5
+    assert after_step(state) == "step", "work is left, so carry on without replanning"
+
+    state["done"] = [_result("a"), _result("b")]
+    assert after_step(state) == "synthesize", "and answer when nothing is left"
+
+
+def test_a_replan_under_the_cap_still_wins():
+    state = new_state("g", budget_limit=1.0)
+    state["plan"] = _steps("a", "b")
+    state["replan_requested"] = True
+    state["replans"] = 4
+    assert after_step(state) == "replan"
+
+
+def test_the_replan_edge_does_not_buy_a_step_past_the_budget():
+    """Review Focus 6. The replan node runs, and then the same budget gate
+    that guards the first step guards the next one."""
+    log: list[str] = []
+
+    def failing_once(state):
+        # One step that asks for a replan without spending anything, which is
+        # what a provider refusal looks like.
+        return {"replan_requested": True, "budget_spent": state["budget_limit"]}
+
+    app = build_graph(plan_fn=_plan_of("a", "b"), execute_fn=failing_once,
+                      replan_fn=lambda s: {"replan_requested": False,
+                                           "replans": s["replans"] + 1},
+                      synthesize_fn=_synth, checkpointer=InMemorySaver())
+    out = app.invoke(new_state("g", budget_limit=1.0), CONFIG)
+    assert out["done"] == [], "no step completed"
+    assert out["replans"] == 1, "one replan ran, and then the budget stopped it"
+
+
 def test_the_cycle_runs_every_step_once_and_stops():
     log: list[str] = []
     app = build_graph(plan_fn=_plan_of("a", "b", "c"), execute_fn=_executor(log),
@@ -1165,7 +1389,7 @@ from collections.abc import Callable
 
 from langgraph.graph import END, START, StateGraph
 
-from lab.planning_agent.state import PlanState, next_step
+from lab.planning_agent.state import MAX_REPLANS, PlanState, next_step
 
 NodeFn = Callable[[PlanState], dict]
 
@@ -1192,8 +1416,11 @@ def after_step(state: PlanState) -> str:
 
     A requested replan comes first: it is set by a step that failed or that
     discovered work, and in both cases the remaining plan is not trustworthy.
+    It does not come before the replan cap, though. A step that fails before
+    its first model call costs nothing, so the budget cannot stop that cycle
+    and MAX_REPLANS is what does.
     """
-    if state["replan_requested"]:
+    if state["replan_requested"] and state["replans"] < MAX_REPLANS:
         return "replan"
     if _out_of_budget(state):
         return "synthesize"
@@ -1216,7 +1443,12 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
     graph.add_conditional_edges(
         "execute_step", after_step,
         {"step": "execute_step", "replan": "replan", "synthesize": "synthesize"})
-    graph.add_edge("replan", "execute_step")
+    # Conditional, not a plain edge. after_step answers "replan" before it
+    # checks the budget, so a plain replan -> execute_step edge buys one step
+    # past the limit. after_plan already checks the budget, an empty plan and
+    # nothing-left, which is exactly the question being asked here.
+    graph.add_conditional_edges(
+        "replan", after_plan, {"step": "execute_step", "synthesize": "synthesize"})
     graph.add_edge("synthesize", END)
     return graph.compile(checkpointer=checkpointer)
 ```
@@ -1224,7 +1456,7 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `python -m pytest lab/planning-agent/tests/test_graph.py -q`
-Expected: PASS, 11 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Prove the budget guard can fail**
 
@@ -1342,11 +1574,23 @@ def test_the_prompt_carries_lessons_so_a_retry_does_not_repeat_them():
 
 
 def test_the_prompt_carries_rollups_instead_of_the_digests_they_replaced():
+    """The rollup has to REPLACE the digests, not join them. `done` is
+    append-only, so nothing can leave it; this filter is the only place the
+    collapse reaches the prompt. Without it a rollup makes the prompt longer."""
     state = new_state("g", budget_limit=1.0)
     state["plan"] = [{"id": "z", "description": "Z", "status": "pending"}]
+    state["done"] = [
+        {"step_id": "a", "digest": "venue A was free", "artifacts": {}, "output_path": ""},
+        {"step_id": "b", "digest": "caterer B replied", "artifacts": {}, "output_path": ""},
+        {"step_id": "c", "digest": "not yet rolled up", "artifacts": {}, "output_path": ""},
+    ]
     state["rollups"] = [{"step_ids": ["a", "b"], "summary": "phase one settled the venue"}]
     prompt = step_prompt(state, state["plan"][0])
+
     assert "phase one settled the venue" in prompt
+    assert "venue A was free" not in prompt, "a rolled-up digest must be gone"
+    assert "caterer B replied" not in prompt
+    assert "not yet rolled up" in prompt, "an unrolled digest stays"
 
 
 def test_a_usage_meter_turns_token_counts_into_dollars():
@@ -1504,10 +1748,20 @@ def parse_artifacts(reply: str) -> dict[str, str]:
 
 
 def _history(state: PlanState) -> str:
+    """What has happened, with anything already summarised left out.
+
+    A rolled-up step's digest must not also appear on its own, or the rollup
+    adds to the prompt instead of shortening it. `done` is append-only, so a
+    rollup cannot remove anything from it; filtering here is how the collapse
+    actually reaches the prompt.
+    """
+    rolled_up = {sid for rollup in state["rollups"] for sid in rollup["step_ids"]}
     lines: list[str] = []
     for rollup in state["rollups"]:
         lines.append(f"- earlier phase ({', '.join(rollup['step_ids'])}): {rollup['summary']}")
     for result in state["done"]:
+        if result["step_id"] in rolled_up:
+            continue
         artifacts = "; ".join(f"{k}={v}" for k, v in result["artifacts"].items())
         lines.append(f"- {result['step_id']}: {result['digest']}"
                      + (f" [{artifacts}]" if artifacts else ""))
@@ -1582,7 +1836,8 @@ def make_execute_step(*, run_loop: Callable, client, model: str, system: str,
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `python -m pytest lab/planning-agent/tests/test_bridge.py -q`
-Expected: PASS, 12 tests.
+Expected: PASS, 12 tests. The rollup test is the one that matters: it is the
+only check that a rollup shortens the prompt rather than adding to it.
 
 - [ ] **Step 5: Write the failing test for the guarded registry**
 
@@ -1970,7 +2225,94 @@ def thread_config(thread_id: str, recursion_limit: int = RECURSION_LIMIT) -> dic
 Run: `python -m pytest lab/planning-agent/tests/test_resume.py -q`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the one test that really kills a process**
+
+The tests above open a second connection in the same interpreter, which is
+close to a restart and cheap enough to run every time. The README's headline
+claim is stronger than that, so one test earns it properly. Append to
+`lab/planning-agent/tests/test_resume.py`:
+
+```python
+import os
+import subprocess
+import sys
+import textwrap
+
+WORKER = '''
+import os, sqlite3, sys
+sys.path.insert(0, {root!r})
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    "_pa", os.path.join({root!r}, "lab", "planning-agent", "_path.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+from lab.planning_agent.graph import build_graph
+from lab.planning_agent.idempotency import DedupTable
+from lab.planning_agent.session import open_saver, thread_config
+from lab.planning_agent.state import new_state, next_step
+
+ckpt, state_db, world, die = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "die"
+saver, conn = open_saver(ckpt)
+dedup_conn = sqlite3.connect(state_db)
+table = DedupTable(dedup_conn); table.setup()
+
+def plan_fn(state):
+    return {{"plan": [{{"id": i, "description": i, "status": "pending"}}
+                     for i in ("a", "b", "c")]}}
+
+def execute_fn(state):
+    step = next_step(state)
+    def act():
+        with open(world, "a", encoding="utf-8") as fh:
+            fh.write(step["id"] + "\\n")
+        return step["id"]
+    table.guard("t1", step["id"], "create_event", {{"n": step["id"]}}, act)
+    if die and step["id"] == "b":
+        # No exception, no unwinding, no checkpoint: the process is simply gone,
+        # which is what a kill -9 or a closed laptop lid does.
+        os._exit(1)
+    return {{"done": [{{"step_id": step["id"], "digest": "", "artifacts": {{}},
+                      "output_path": ""}}],
+            "budget_spent": state["budget_spent"] + 0.01}}
+
+app = build_graph(plan_fn=plan_fn, execute_fn=execute_fn,
+                  replan_fn=lambda s: {{}}, synthesize_fn=lambda s: {{}},
+                  checkpointer=saver)
+app.invoke(new_state("g", 10.0) if sys.argv[5] == "start" else None,
+           thread_config("t1"))
+conn.close(); dedup_conn.close()
+'''
+
+
+def test_a_killed_process_resumes_without_repeating_the_side_effect(tmp_path):
+    """The claim the README makes, tested the way the README words it. The
+    first process does not raise: it calls os._exit(1) after the side effect has
+    committed and before the checkpoint does, so nothing unwinds."""
+    root = str(Path(__file__).resolve().parents[3])
+    worker = tmp_path / "worker.py"
+    worker.write_text(textwrap.dedent(WORKER).format(root=root), encoding="utf-8")
+    ckpt, state_db, world = (str(tmp_path / "ckpt.sqlite"),
+                             str(tmp_path / "state.db"), str(tmp_path / "world.txt"))
+
+    first = subprocess.run([sys.executable, str(worker), ckpt, state_db, world,
+                            "die", "start"], capture_output=True, text=True)
+    assert first.returncode == 1, f"the worker should have died: {first.stderr}"
+    assert Path(world).read_text().split() == ["a", "b"]
+
+    second = subprocess.run([sys.executable, str(worker), ckpt, state_db, world,
+                             "live", "resume"], capture_output=True, text=True)
+    assert second.returncode == 0, second.stderr
+    assert Path(world).read_text().split() == ["a", "b", "c"], (
+        "'b' committed before the process died and must not commit again")
+```
+
+Add `from pathlib import Path` to the module's imports if it is not there yet.
+
+Run: `python -m pytest lab/planning-agent/tests/test_resume.py -q`
+Expected: PASS, 6 tests. This one spawns two interpreters, so it is the slowest
+in the topic; it is also the only one that proves the claim without a caveat.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add lab/planning-agent/session.py lab/planning-agent/tests/test_resume.py
@@ -1981,6 +2323,11 @@ A crashed run picks up from the last completed step with a new connection,
 which is what a restarted process has. The paired test shows the dedup table
 is what keeps the world consistent: without it the same run leaves
 ['a','b','b','c'] behind, with it ['a','b','c'].
+
+One test goes further and really kills an interpreter with os._exit(1) after a
+side effect has committed and before the checkpoint has, then resumes in a
+second one. That is the claim the README makes, so it is worth the two process
+spawns it costs.
 MSG
 )"
 ```
@@ -2084,6 +2431,19 @@ def test_a_replan_may_legitimately_shorten_the_plan_below_what_is_done():
     assert next_step(state)["id"] == "c"
 
 
+def test_every_replan_counts_towards_the_cap():
+    """Review Focus 7. The count is what a renamed step cannot evade."""
+    merged = make_replanner(lambda **kw: _steps("b2"))(_state_with_a_failure())
+    assert merged["replans"] == 1
+
+
+def test_a_replan_that_raises_still_counts():
+    def boom(**kw):
+        raise RuntimeError("no")
+
+    assert make_replanner(boom)(_state_with_a_failure())["replans"] == 1
+
+
 def test_a_failing_proposer_leaves_the_plan_alone_and_records_the_failure():
     def boom(**kw):
         raise RuntimeError("the planner model refused")
@@ -2146,13 +2506,21 @@ def make_replanner(propose: Propose) -> Callable[[PlanState], dict]:
                             done=done, lessons=list(state["lessons"]))
         except Exception as exc:
             # A broken replanner must not wipe the plan and must not leave the
-            # request set, which would route straight back here for ever.
+            # request set, which would route straight back here for ever. The
+            # attempt still counts: a replanner that raises every time is
+            # exactly what MAX_REPLANS exists to stop.
             return {"replan_requested": False,
-                    "last_error": f"{type(exc).__name__}: {exc}"}
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                    "replans": state["replans"] + 1}
 
         return {"plan": list(steps),
                 "replan_requested": False,
                 "last_error": "",
+                # Counted here, not in the router: this is where a replan
+                # actually happened. after_step reads it and stops at
+                # MAX_REPLANS, which is the bound a replanner cannot evade by
+                # renaming the step that keeps failing.
+                "replans": state["replans"] + 1,
                 "revisions": [Revision(
                     after_step=last,
                     change="remaining steps are now "
@@ -2165,7 +2533,7 @@ def make_replanner(propose: Propose) -> Callable[[PlanState], dict]:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `python -m pytest lab/planning-agent/tests/test_replan.py -q`
-Expected: PASS, 7 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Prove the loop guard can fail**
 
@@ -2239,16 +2607,43 @@ def test_steps_already_inside_a_rollup_are_not_rolled_up_again():
     assert merged["rollups"][0]["step_ids"] == [f"s{i}" for i in range(8, 16)]
 
 
-def test_prompt_growth_is_flat_with_rollups_and_linear_without():
-    """The spec's claim, measured. Per-step digests bound each step's cost;
-    only rollups bound the task's."""
+def test_rollups_slow_prompt_growth_without_flattening_it():
+    """Measured, not claimed. Rollups cut the final prompt by about 2.2x over
+    24 steps; they do not flatten growth, because one rollup accumulates per
+    eight steps. The ratio is asserted with headroom so an unrelated prompt
+    tweak does not redden this, and `measure` reads its digest size from
+    digest.py rather than hardcoding one: a measurement that drifts from the
+    real prompt path measures nothing."""
     without = measure(steps=24, roll_up=False)
     with_rollups = measure(steps=24, roll_up=True)
 
     assert without[-1]["prompt_chars"] > without[0]["prompt_chars"] * 3, (
         "without rollups the prompt should grow substantially")
-    assert with_rollups[-1]["prompt_chars"] < without[-1]["prompt_chars"] / 2, (
-        "rollups should more than halve the final prompt")
+    ratio = without[-1]["prompt_chars"] / with_rollups[-1]["prompt_chars"]
+    assert ratio > 1.8, f"rollups should cut the final prompt well past a fifth: {ratio:.2f}x"
+
+    # Still linear, just cheaper. Doubling the steps roughly doubles the
+    # prompt even with rollups on, because rollups accumulate at one per eight
+    # steps. Asserting anything better than this would be asserting a property
+    # the design does not have: the first version of this test claimed
+    # sublinear growth and measured 3,577 -> 7,422, which is 2.07x.
+    short = measure(steps=12, roll_up=True)[-1]["prompt_chars"]
+    long = with_rollups[-1]["prompt_chars"]
+    assert 1.8 < long / short < 2.4, (
+        f"growth with rollups is linear in steps, not flat: {short} -> {long}")
+
+
+def test_the_measurement_uses_the_same_digest_size_as_the_bridge():
+    """The reason the old assertion failed. Digesting at 120 chars while a
+    rollup caps at 800 makes eight digests and one rollup almost the same size,
+    so the mechanism looked worthless when it was the measurement that was
+    wrong."""
+    from lab.planning_agent import digest as digest_module
+
+    rows = measure(steps=2, roll_up=False)
+    assert digest_module.STEP_DIGEST_CHARS == 600, (
+        "if this changes, the ratio above moves and the README numbers are stale")
+    assert rows[1]["prompt_chars"] > rows[0]["prompt_chars"]
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2318,17 +2713,40 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from lab.planning_agent.bridge import step_prompt
+# The hyphen in the directory name means `lab.planning_agent` does not exist
+# until the alias is installed, and no conftest runs for a plain `python`
+# invocation. This import has to come before any lab.planning_agent one, which
+# is why it is not sorted with them.
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "lab_planning_agent_path", Path(__file__).resolve().parent / "_path.py")
+_path_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_path_module)
+
+from lab.planning_agent.bridge import step_prompt  # noqa: E402
 from lab.planning_agent.graph import build_graph, maybe_roll_up
 from lab.planning_agent.session import open_saver, thread_config
 from lab.planning_agent.state import new_state, next_step
 
 STEP_OUTPUT = "x" * 3000
+# measure() appends to `done` and never removes from it, because the reducer
+# does not allow removal. The prompt gets shorter only because _history skips
+# steps that a rollup already covers.
 
 
 def measure(steps: int, roll_up: bool) -> list[dict]:
-    """Prompt size per step, with and without rollups."""
-    from lab.planning_agent.digest import step_digest
+    """Prompt size per step, with and without rollups.
+
+    Two rules keep this honest. The digest size comes from digest.py, the same
+    one the bridge uses, because a measurement at a different size measures a
+    system nobody runs. And `done` is only ever appended to, exactly as the
+    reducer requires: an earlier version of this function deleted rolled-up
+    entries from it, which no graph can do, so it measured a prompt the real
+    one never produced. The shortening comes from `_history` filtering, which
+    is what step_prompt actually does.
+    """
+    from lab.planning_agent.digest import STEP_DIGEST_CHARS, step_digest
 
     rows: list[dict] = []
     state = new_state("measure prompt growth", budget_limit=1e9)
@@ -2340,14 +2758,13 @@ def measure(steps: int, roll_up: bool) -> list[dict]:
             break
         rows.append({"step": step["id"], "prompt_chars": len(step_prompt(state, step))})
         state["done"] = state["done"] + [{
-            "step_id": step["id"], "digest": step_digest(STEP_OUTPUT, limit=120),
+            "step_id": step["id"],
+            "digest": step_digest(STEP_OUTPUT, limit=STEP_DIGEST_CHARS),
             "artifacts": {}, "output_path": ""}]
         if roll_up:
             merged = maybe_roll_up(state)
             if merged:
                 state["rollups"] = state["rollups"] + merged["rollups"]
-                inside = {sid for r in state["rollups"] for sid in r["step_ids"]}
-                state["done"] = [r for r in state["done"] if r["step_id"] not in inside]
     return rows
 
 
@@ -2417,13 +2834,17 @@ router.
 Run: `python lab/planning-agent/run.py --measure 24`
 Run: `python lab/planning-agent/run.py --smoke 20`
 Expected: a table where the no-rollups column grows step by step and the
-rollups column resets every eight steps. Copy the final line into Task 11.
+rollups column grows far more slowly, stepping up once per rollup rather than
+resetting. Over 24 steps expect roughly 16,000 chars without rollups against
+roughly 7,400 with them, a ratio near 2.2x. Copy the real final line into Task
+11; if the ratio is below 1.8 the test above has already failed and the cause
+is a digest or rollup size that no longer match.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add lab/planning-agent/run.py lab/planning-agent/graph.py lab/planning-agent/tests/test_rollup_flow.py
-git commit -m "Collapse finished phases so prompt growth stays flat"
+git commit -m "Collapse finished phases to cut the prompt by about 2.2x"
 ```
 
 ---
@@ -2460,10 +2881,29 @@ structure and not of a provider on the day.
   `send_message` and `save_note` do not. And `create_event`'s guard runs before
   the ics write and the Apple and Google syncs, so a replay is told "already
   exists" and those syncs never happen.
-- **Prompt growth:** <N> chars at the last of 24 steps without rollups,
-  <M> with. Per-step digests bound each step; only rollups bound the task.
+- **Rollups slow prompt growth; they do not flatten it.** <N> chars at the
+  last of 24 steps without rollups, <M> with, a ratio of <R>x. Growth over the
+  run falls from about 18x to about 8x. Flat growth would need a second
+  compaction tier, a rollup of rollups, which this topic did not build: there
+  is no measurement past 24 steps to justify compounding the summarising loss.
+- **A rollup only shortens a prompt if the digests it replaced leave.** `done`
+  is append-only, so nothing can be removed from it; the prompt builder has to
+  skip the steps a rollup already covers. Built the other way, a rollup makes
+  the prompt longer, and a measurement that edits `done` directly will not
+  show it.
 - **Checkpoint size** did not grow with the number of finished steps once full
   outputs moved to the scratch directory.
+- **The budget is not a termination bound.** A step whose loop raises before
+  its first model call costs nothing, so `budget_spent` never moves and the
+  step is selected again indefinitely. Two bounds fixed it: a step with two
+  lessons against it is skipped, and the task caps total replans. The per-step
+  bound alone is evadable, because a replanner that renames a failed step
+  resets its lesson count.
+- **A dedup table has to record failures as failures.** `ToolRegistry.execute`
+  returns a tool's exception as an ordinary string, so a table that stores
+  results without a status replays a timeout for ever. Recording every outcome
+  with `ok` or `error`, and replaying only `ok`, keeps the crash window closed
+  while leaving a transient failure retryable.
 ```
 
 - [ ] **Step 2: Write the graduation verdict**

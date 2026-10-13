@@ -164,6 +164,12 @@ START -> plan -> route (code reads state["strategy"])
                    +-- done or out of budget -> synthesize -> END
 ```
 
+**The strategy split did not survive implementation.** The topology above is
+the design as drawn; the plan collapsed it into one plan-execute-replan cycle,
+because the three strategies differ by prompt rather than by topology. Section
+13 question 3 anticipated exactly that, and the plan's "Deliberately not in
+this plan" records it. There is no `strategy` field and no `decompose` node.
+
 **Control flow is code, never a model.** The planner writes `strategy` and
 `plan` into state; plain Python conditional-edge functions read them and pick
 the edge. This keeps `agent-graphs-design.md` decision §7.4 ("Routers are code,
@@ -339,9 +345,14 @@ reported in the README's "What we found":
 - **Lessons are used, not just stored.** Force a step to fail in a way that
   invites the same approach again, and assert the replanner's next plan differs.
   A `Lesson` nothing reads is dead weight.
-- **Context stays flat.** Run a task of at least twenty steps and record prompt
-  tokens per step. Per-step digests alone grow linearly, so the number to beat
-  is flat growth *with rollups on*; measure both, and report the pair.
+- **Rollups slow prompt growth; they do not flatten it.** Run a task of at
+  least twenty steps and record prompt size per step, with rollups on and off.
+  Per-step digests grow linearly. Rollups do not stop the growth, because the
+  rollups themselves accumulate: one per eight steps. Measured over 24 steps at
+  the bridge's own digest size, the final prompt is 2.2 times smaller with
+  rollups on, and growth over the run falls from 18x to 8x. Report that pair.
+  Flat growth would need a second compaction tier (a rollup of rollups), which
+  this topic does not build and has no measurement to justify.
 - **Offload keeps checkpoints small.** Record checkpoint size per step. It
   should not grow with the number of completed steps.
 - **Routers stay code.** No LLM call decides an edge.
@@ -383,7 +394,9 @@ table in place is how a demo double-books a calendar.
    summarised.
 10. **A failure appends a `Lesson`**, and the replanner reads it. Roll back the
     work, keep the reflection.
-11. **Finished phases collapse into a `Rollup`**, so prompt growth stays flat.
+11. **Finished phases collapse into a `Rollup`**, which cuts the prompt by
+    roughly 2.2x over 24 steps rather than flattening it: rollups accumulate
+    too, one per eight steps.
 12. **Side-effecting tools get an idempotency key and a dedup table** in
     `state.db`; at-least-once with deduplication, not exactly-once. This lands
     before the resume demonstration, not after.
