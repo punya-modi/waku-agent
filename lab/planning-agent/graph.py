@@ -1,8 +1,8 @@
 r"""The topology: plan, then a bounded execute cycle, then one answer.
 
-    START -> plan -> after_plan -> execute_step -> after_step -> execute_step
-                          |                            |  \-> replan -> execute_step
-                          \-> synthesize -> END        \-> synthesize -> END
+    START -> plan -> after_plan -> execute_step -> roll_up -> after_step -> execute_step
+                          |                                        |  \-> replan -> execute_step
+                          \-> synthesize -> END                    \-> synthesize -> END
 
 Control flow is code. The nodes write state and these two router functions read
 it, which is the rule `waku/graph/` already follows: models produce state,
@@ -69,8 +69,10 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
     graph.add_edge(START, "plan")
     graph.add_conditional_edges(
         "plan", after_plan, {"step": "execute_step", "synthesize": "synthesize"})
+    graph.add_node("roll_up", lambda state: maybe_roll_up(state))
+    graph.add_edge("execute_step", "roll_up")
     graph.add_conditional_edges(
-        "execute_step", after_step,
+        "roll_up", after_step,
         {"step": "execute_step", "replan": "replan", "synthesize": "synthesize"})
     # Conditional, not a plain edge. after_step answers "replan" before it
     # checks the budget, so a plain replan -> execute_step edge buys one step
@@ -80,3 +82,26 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
         "replan", after_plan, {"step": "execute_step", "synthesize": "synthesize"})
     graph.add_edge("synthesize", END)
     return graph.compile(checkpointer=checkpointer)
+
+
+ROLL_UP_EVERY = 8
+
+
+def _unrolled(state: PlanState) -> list:
+    inside = {sid for rollup in state["rollups"] for sid in rollup["step_ids"]}
+    return [r for r in state["done"] if r["step_id"] not in inside]
+
+
+def maybe_roll_up(state: PlanState, every: int = ROLL_UP_EVERY) -> dict:
+    """Collapse a finished phase once enough steps have piled up.
+
+    A one-line digest per step still grows linearly, so past a couple of dozen
+    steps the digest list alone crowds the prompt. The outputs stay on disk, so
+    this shortens the prompt and loses nothing.
+    """
+    from lab.planning_agent.digest import make_rollup
+
+    pending = _unrolled(state)
+    if len(pending) < every:
+        return {}
+    return {"rollups": [make_rollup(pending[:every])]}

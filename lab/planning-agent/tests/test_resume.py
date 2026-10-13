@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("langgraph")
 
+from lab.planning_agent.digest import ROLLUP_CHARS
 from lab.planning_agent.graph import build_graph
 from lab.planning_agent.idempotency import DedupTable
 from lab.planning_agent.session import open_dedup, open_saver, thread_config
@@ -135,9 +136,14 @@ def test_the_checkpoint_does_not_grow_with_the_number_of_finished_steps(tmp_path
     sizes = [len(str(snap.values)) for snap in app.get_state_history(thread_config("t1"))]
     conn.close()
     growth = max(sizes) - min(sizes)
-    assert growth < 12 * 400, (
+    # What state is allowed to gain over the run: one 200-char digest per step
+    # with room for the record around it, the 12-step plan, and the one rollup
+    # the roll_up node collapses at eight steps. A 4KB step output riding in
+    # state would be 48,000, so this still catches the thing it guards.
+    allowance = 12 * 400 + ROLLUP_CHARS + 200
+    assert growth < allowance, (
         "state grew faster than one 200-char digest per step; something large "
-        f"is riding in state (growth={growth})")
+        f"is riding in state (growth={growth}, allowance={allowance})")
 
 
 def test_waku_create_event_reports_already_exists_on_a_replay(tmp_path):
@@ -169,6 +175,7 @@ spec = importlib.util.spec_from_file_location(
     "_pa", os.path.join({root!r}, "lab", "planning-agent", "_path.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
+from lab.planning_agent.digest import ROLLUP_CHARS
 from lab.planning_agent.graph import build_graph
 from lab.planning_agent.idempotency import DedupTable
 from lab.planning_agent.session import open_saver, thread_config
