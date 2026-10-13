@@ -1,6 +1,6 @@
 # 10 — rollups and the measurements
 
-Status: ready-for-agent
+Status: done
 Blocked by: 03, 06, 07
 Plan task: Task 10 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

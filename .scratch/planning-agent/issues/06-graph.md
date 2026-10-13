@@ -1,6 +1,6 @@
 # 06 — graph: the topology and the code routers
 
-Status: ready-for-agent
+Status: done
 Blocked by: 02
 Plan task: Task 6 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

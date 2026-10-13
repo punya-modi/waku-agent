@@ -1,6 +1,6 @@
 # 09 — the replanner, and lessons that get read
 
-Status: ready-for-agent
+Status: done
 Blocked by: 02
 Plan task: Task 9 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

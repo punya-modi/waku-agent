@@ -1,6 +1,6 @@
 # 02 — state: the records, the reducers, next-step selection
 
-Status: ready-for-agent
+Status: done
 Blocked by: 01
 Plan task: Task 2 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

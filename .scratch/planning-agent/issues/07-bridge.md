@@ -1,6 +1,6 @@
 # 07 — bridge: one step is one Waku loop turn
 
-Status: ready-for-agent
+Status: done
 Blocked by: 02, 03, 04, 05
 Plan task: Task 7 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

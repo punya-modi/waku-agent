@@ -1,6 +1,6 @@
 # 11 — the findings and the graduation verdict
 
-Status: ready-for-agent
+Status: done
 Blocked by: 10
 Plan task: Task 11 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

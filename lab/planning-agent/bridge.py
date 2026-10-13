@@ -7,8 +7,13 @@ Waku experiment rather than a LangGraph tutorial.
 
 What the step reads is the point. It gets the goal, the plan, the rollups of
 finished phases, the digests and artifacts of recent steps, and any lessons.
-It never gets an earlier step's transcript: that is on disk, and the step can
-ask for it.
+It never gets an earlier step's transcript: that is on disk, under the path in
+each StepResult, where Scratch.read and Scratch.search reach it.
+
+Nothing here registers those two as tools, so a step cannot yet ask for an
+earlier output itself; READ_ONLY already names the two tools that would do it
+(`read_step_output`, `search_step_outputs`), and wiring them up is a follow-up,
+not a thing this topic measured.
 """
 
 from __future__ import annotations
@@ -19,7 +24,9 @@ from waku.loop.trim import shrink_seen
 
 from lab.planning_agent.digest import step_digest
 from lab.planning_agent.offload import Scratch
-from lab.planning_agent.state import Lesson, PlanState, Step, StepResult, next_step
+from lab.planning_agent.state import (
+    Lesson, PlanState, Step, StepResult, finished_ids, next_step, rolled_up_ids,
+)
 
 ARTIFACTS_MARKER = "ARTIFACTS:"
 
@@ -91,7 +98,7 @@ def _history(state: PlanState) -> str:
     rollup cannot remove anything from it; filtering here is how the collapse
     actually reaches the prompt.
     """
-    rolled_up = {sid for rollup in state["rollups"] for sid in rollup["step_ids"]}
+    rolled_up = rolled_up_ids(state)
     lines: list[str] = []
     for rollup in state["rollups"]:
         lines.append(f"- earlier phase ({', '.join(rollup['step_ids'])}): {rollup['summary']}")
@@ -110,8 +117,13 @@ def _history(state: PlanState) -> str:
 
 
 def step_prompt(state: PlanState, step: Step) -> str:
+    # The status shown is derived from `done`, not read off the Step. Nothing
+    # writes a Step's own status field after the planner sets it, so reciting
+    # it would print "[pending]" against work the model has already finished.
+    finished = finished_ids(state)
     plan = "\n".join(
-        f"{i}. [{s['status']}] {s['description']}" for i, s in enumerate(state["plan"], 1))
+        f"{i}. [{'done' if s['id'] in finished else s['status']}] {s['description']}"
+        for i, s in enumerate(state["plan"], 1))
     return PROMPT.format(goal=state["goal"], plan=plan, history=_history(state),
                          step=step["description"], marker=ARTIFACTS_MARKER)
 

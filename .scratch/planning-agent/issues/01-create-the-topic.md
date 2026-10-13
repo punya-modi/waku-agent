@@ -1,6 +1,6 @@
 # 01 — Create the topic, pin the versions, keep CI green
 
-Status: ready-for-agent
+Status: done
 Blocked by: none
 Plan task: Task 1 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

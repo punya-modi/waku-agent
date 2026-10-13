@@ -1,6 +1,6 @@
 # 08 — session and the resume checks
 
-Status: ready-for-agent
+Status: done
 Blocked by: 05, 06
 Plan task: Task 8 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

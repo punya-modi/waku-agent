@@ -4,6 +4,11 @@ Two files, two jobs. The checkpointer's own SQLite file holds the task's
 progress and may be deleted with the task. The dedup table lives in Waku's
 state.db, because it must outlive any single task: it is the record of what
 was already done to the world.
+
+    pip install langgraph langgraph-checkpoint-sqlite
+    python -m pytest lab/planning-agent/tests/test_resume.py -q
+
+SDK: langgraph 1.2.15 + langgraph-checkpoint-sqlite 3.1.2. Verified 2026-10-12.
 """
 
 from __future__ import annotations

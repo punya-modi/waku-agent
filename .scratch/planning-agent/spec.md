@@ -1,6 +1,6 @@
 # Planning agent
 
-Status: ready-for-agent
+Status: done
 
 The spec for this feature is repo documentation, not a scratch file, because it
 is versioned with the code it describes:

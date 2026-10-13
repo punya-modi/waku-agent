@@ -10,6 +10,11 @@ functions pick the edge. Nothing here asks a model which way to go.
 
 The node functions are injected so tests script them and the real client is
 bound at the edge, the same shape as waku/graph/workflows/triage.py.
+
+    pip install langgraph langgraph-checkpoint-sqlite
+    python -m pytest lab/planning-agent/tests -q
+
+SDK: langgraph 1.2.15. Verified 2026-10-12.
 """
 
 from __future__ import annotations
@@ -18,7 +23,9 @@ from collections.abc import Callable
 
 from langgraph.graph import END, START, StateGraph
 
-from lab.planning_agent.state import MAX_REPLANS, PlanState, next_step
+from lab.planning_agent.state import (
+    MAX_REPLANS, PlanState, next_step, rolled_up_ids,
+)
 
 NodeFn = Callable[[PlanState], dict]
 
@@ -69,7 +76,7 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
     graph.add_edge(START, "plan")
     graph.add_conditional_edges(
         "plan", after_plan, {"step": "execute_step", "synthesize": "synthesize"})
-    graph.add_node("roll_up", lambda state: maybe_roll_up(state))
+    graph.add_node("roll_up", maybe_roll_up)
     graph.add_edge("execute_step", "roll_up")
     graph.add_conditional_edges(
         "roll_up", after_step,
@@ -87,9 +94,9 @@ def build_graph(*, plan_fn: NodeFn, execute_fn: NodeFn, replan_fn: NodeFn,
 ROLL_UP_EVERY = 8
 
 
-def _unrolled(state: PlanState) -> list:
-    inside = {sid for rollup in state["rollups"] for sid in rollup["step_ids"]}
-    return [r for r in state["done"] if r["step_id"] not in inside]
+def _results_not_yet_rolled_up(state: PlanState) -> list:
+    covered = rolled_up_ids(state)
+    return [r for r in state["done"] if r["step_id"] not in covered]
 
 
 def maybe_roll_up(state: PlanState, every: int = ROLL_UP_EVERY) -> dict:
@@ -101,7 +108,7 @@ def maybe_roll_up(state: PlanState, every: int = ROLL_UP_EVERY) -> dict:
     """
     from lab.planning_agent.digest import make_rollup
 
-    pending = _unrolled(state)
+    pending = _results_not_yet_rolled_up(state)
     if len(pending) < every:
         return {}
     return {"rollups": [make_rollup(pending[:every])]}

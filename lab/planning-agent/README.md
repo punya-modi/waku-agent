@@ -75,6 +75,19 @@ checkpoint records what the program knew, never what happened in the world,
 and the table that closes that gap is only correct if it can tell a failure
 from a result.
 
+Three limits are known and left standing, because measuring them was not what
+this topic set out to do:
+
+- The budget gate sits after the `plan` node, so a limit of zero stops every
+  step but still pays for the one planner call.
+- A rollup caps its summary at 800 chars, and the prompt builder drops every
+  digest the rollup covers. The tail of a long phase can therefore leave the
+  prompt, and no tool yet lets a step read it back off disk.
+- `looks_like_failure` matches the two prefixes `ToolRegistry` and the tools
+  actually produce. A tool that returns its own error prose in some other
+  shape is recorded `ok` and replayed, which is the failure the status column
+  narrows rather than closes.
+
 ## Video angle
 
 The hook: a checkpoint tells you what the program knew, not what happened in
@@ -83,10 +96,10 @@ node, so a step that booked a meeting and then died books it twice.
 
 ## Graduation
 
-**Copy the idea, not the dependency.** `waku/graph/` should grow its own
-SQLite checkpointer rather than take LangGraph. Nothing this topic needed from
-LangGraph is large: a `thread_id`, a serialised state blob, a step cursor and
-the two reducers. The checkpointer is the part that earns its keep, and it is
+`waku/graph/` should copy the idea and leave the dependency: it should grow
+its own SQLite checkpointer rather than take LangGraph. Nothing this topic
+needed from LangGraph is large: a `thread_id`, a serialised state blob, a step
+cursor and the two reducers. The checkpointer is the part that earns its keep, and it is
 about a hundred lines against a dependency tree of roughly forty packages,
 `langgraph`, `langgraph-checkpoint-sqlite`, `langchain-core`, `langsmith`,
 `pydantic`, `httpx`, `orjson` and `zstandard` among them. Hard rule 3 says the

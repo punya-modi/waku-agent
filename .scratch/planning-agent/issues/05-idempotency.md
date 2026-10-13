@@ -1,6 +1,6 @@
 # 05 — idempotency: so resume cannot repeat a side effect
 
-Status: ready-for-agent
+Status: done
 Blocked by: 01
 Plan task: Task 5 in `docs/superpowers/plans/2026-10-11-planning-agent.md`
 

@@ -77,6 +77,16 @@ def new_state(goal: str, budget_limit: float) -> PlanState:
                      replan_requested=False, last_error="", replans=0)
 
 
+def finished_ids(state: PlanState) -> set[str]:
+    """The ids of steps that produced a result. The one definition of done."""
+    return {result["step_id"] for result in state["done"]}
+
+
+def rolled_up_ids(state: PlanState) -> set[str]:
+    """The ids of steps a rollup already covers, so nothing counts them twice."""
+    return {sid for rollup in state["rollups"] for sid in rollup["step_ids"]}
+
+
 def attempts(state: PlanState, step_id: str) -> int:
     """How many times a step has been tried and left a lesson behind."""
     return sum(1 for lesson in state["lessons"] if lesson["step_id"] == step_id)
@@ -95,7 +105,7 @@ def next_step(state: PlanState) -> Step | None:
     `budget_spent` untouched, and is selected again for ever: the budget is not
     a termination bound when failing is free.
     """
-    finished = {result["step_id"] for result in state["done"]}
+    finished = finished_ids(state)
     for step in state["plan"]:
         if step["id"] in finished:
             continue

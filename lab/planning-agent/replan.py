@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from lab.planning_agent.state import PlanState, Revision, Step, StepResult
+from lab.planning_agent.state import (
+    PlanState, Revision, Step, StepResult, finished_ids,
+)
 
 Propose = Callable[..., list[Step]]
 
@@ -24,7 +26,7 @@ def preserved(state: PlanState) -> list[StepResult]:
 
 
 def _remaining(state: PlanState) -> list[Step]:
-    finished = {result["step_id"] for result in state["done"]}
+    finished = finished_ids(state)
     return [step for step in state["plan"] if step["id"] not in finished]
 
 
