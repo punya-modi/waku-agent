@@ -6135,6 +6135,9 @@ mcp = [
 notion = [
     { name = "notion-client" },
 ]
+planning = [
+    { name = "langgraph" },
+]
 supabase = [
     { name = "supabase" },
 ]
@@ -6177,6 +6180,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'whatsapp'", specifier = ">=0.25" },
     { name = "kokoro", marker = "extra == 'voice-neural'", specifier = ">=0.9" },
     { name = "langgraph", marker = "extra == 'arena'", specifier = ">=0.3" },
+    { name = "langgraph", marker = "extra == 'planning'" },
     { name = "langmem", marker = "extra == 'arena'", specifier = ">=0.0.30" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.1" },
     { name = "mem0ai", marker = "extra == 'arena'", specifier = ">=2.0" },
@@ -6197,7 +6201,7 @@ requires-dist = [
     { name = "supabase", marker = "extra == 'supabase'", specifier = ">=2.0" },
     { name = "zep-cloud", marker = "extra == 'arena'", specifier = ">=2.0" },
 ]
-provides-extras = ["arena", "dev", "discord", "eval", "gcal", "hosted", "mcp", "notion", "supabase", "telegram", "tracing", "voice", "voice-neural", "whatsapp"]
+provides-extras = ["arena", "dev", "discord", "eval", "gcal", "hosted", "mcp", "notion", "planning", "supabase", "telegram", "tracing", "voice", "voice-neural", "whatsapp"]
 
 [[package]]
 name = "wasabi"
