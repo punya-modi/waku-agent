@@ -46,6 +46,10 @@ class PlanState(TypedDict, total=False):
     done: Annotated[list[dict], operator.add]  # one {step_id, digest} per Step run
     lessons: Annotated[list[dict], operator.add]
     revisions: Annotated[list[dict], operator.add]
+    # A tool call a Step was not allowed to make alone: {id, step_id, tool, args}.
+    # It waits for the next Approval gate; `executed` holds the ids that ran after.
+    escalations: Annotated[list[dict], operator.add]
+    executed: Annotated[list[str], operator.add]
     replan_requested: bool
     digest: str
 

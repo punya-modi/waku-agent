@@ -62,9 +62,10 @@ Additionally, and worth stating because people ask:
   needs an API key, which CI does not have.
 - **No provider smoke check.** Nothing verifies that a model in the picker
   resolves, which is why #137 reached a user.
-- **No LangGraph dependency.** `lab/planning-agent/` built a resumable planning
-  agent on it and concluded that `waku/graph/` should grow its own SQLite
-  checkpointer instead; the verdict and the measurements are in that topic's
+- **LangGraph only behind an extra.** The default install has no LangGraph
+  dependency. `/plan` needs the `[planning]` extra (ADR-0001), even though
+  `lab/planning-agent/` concluded that `waku/graph/` should grow its own SQLite
+  checkpointer instead; that verdict and its measurements are in that topic's
   README.
 
 ## Open questions
